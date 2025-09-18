@@ -1,253 +1,191 @@
-# client.py
+"""
+UDP File Client (orientado a objetos)
+Uso: python client.py --server-ip <ip> --server-port <port>
+O cliente solicita: GET filename [droplist]
+Exemplo de GET com simulação de perda (o cliente vai "dropar" os segmentos 3,7,12 quando recebê-los):
+GET abc.ext 3,7,12
+
+Para pedir retransmissão de segmentos:
+RETR filename 3,7,12
+RETR filename all
+"""
+
 import socket
-import argparse
 import struct
+import argparse
 import binascii
 import os
-import time
 
-HDR_FMT = "!IIHI"
+HDR_FMT = "!IIHIB"
 HDR_SIZE = struct.calcsize(HDR_FMT)
+TIMEOUT = 2.0
 PAYLOAD_SIZE = 1024
-RECV_BUF = 65536
-TIMEOUT = 3.0  # seconds to wait for packets after FIN
+RECV_BUFFER = 65536
 
+class UDPFileClient:
+    def __init__(self, server_ip, server_port, save_dir="."):
+        self.server = (server_ip, server_port)
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.settimeout(TIMEOUT)
+        self.save_dir = save_dir
+        # armazenamento entre comandos
+        self.filename = None
+        self.total_segments = None
+        self.segments = {}      # seq -> bytes
+        self.crc_ok = {}        # seq -> bool
+        print(f"[Client] Server set to {self.server}")
 
-def parse_header_and_payload(packet):
-    if len(packet) < HDR_SIZE:
-        return None
-    header = packet[:HDR_SIZE]
-    seq, total, payload_len, crc = struct.unpack(HDR_FMT, header)
-    payload = packet[HDR_SIZE:HDR_SIZE+payload_len]
-    return seq, total, payload_len, crc, payload
+    def send_request(self, text):
+        self.sock.sendto(text.encode(), self.server)
+        print(f"[Client] Sent request: {text}")
 
-
-def main():
-    parser = argparse.ArgumentParser(description="UDP file client")
-    parser.add_argument("--server-ip", required=True, help="UDP server IP")
-    parser.add_argument("--server-port", required=False, type=int, default=12000, help="UDP server port")
-    args = parser.parse_args()
-
-    server_addr = (args.server_ip, args.server_port)
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.settimeout(5.0)
-
-    print(f"[+] Cliente pronto. Conectando a {server_addr}")
-    # Interactive loop for GET/RETR
-    last_filename = None
-    while True:
-        cmd = input("Digite comando (ex: GET nome.ext 3,7,12 | quit): ").strip()
-        if not cmd:
-            continue
-        if cmd.lower() == "quit":
-            print("Saindo.")
-            break
-        if not cmd.upper().startswith("GET "):
-            print("Por favor inicie com GET ...")
-            continue
-
-        # Send GET
-        sock.sendto(cmd.encode(), server_addr)
-        parts = cmd.split()
-        # parse drop list if provided in GET line (simulate loss) -> only for initial GET
-        drop_list = set()
-        if len(parts) >= 3:
-            drops = parts[2]
-            for tok in drops.split(","):
-                tok = tok.strip()
-                if tok:
-                    try:
-                        drop_list.add(int(tok))
-                    except:
-                        pass
-
-        # Determine filename
-        filename = parts[1]
-        last_filename = filename
-        print(f"[+] Requisitando {filename} (simulate drop: {sorted(drop_list)})")
-
-        # Prepare receive structures
-        segments = {}   # seq -> payload bytes
-        crc_ok = {}     # seq -> True/False
-        expected_total = None
-        got_fin = False
-
-        # We'll only simulate drops during this GET receive phase
-        in_get_phase = True
-
-        # Receive loop: collect until FIN and timeout
+    def receive_file_cycle(self, drop_set=None):
+        """
+        Recebe segmentos até timeout ou EOF.
+        Atualiza self.segments e self.crc_ok.
+        """
         while True:
             try:
-                data, addr = sock.recvfrom(RECV_BUF)
+                data, _ = self.sock.recvfrom(RECV_BUFFER)
             except socket.timeout:
-                if got_fin:
-                    break
-                else:
-                    print("[!] Timeout sem FIN, tentando esperar mais 2s...")
-                    sock.settimeout(2.0)
-                    try:
-                        data, addr = sock.recvfrom(RECV_BUF)
-                    except socket.timeout:
-                        break
-            # Process data
-            try:
-                text = data.decode(errors="ignore")
-            except:
-                text = ""
-            if text.startswith("ERR"):
-                print("[SERVER ERROR] " + text)
                 break
-            if text.startswith("FIN"):
-                parts_fin = text.split()
-                if len(parts_fin) >= 2:
-                    try:
-                        expected_total = int(parts_fin[1])
-                        got_fin = True
-                        print(f"[+] Recebeu FIN. total={expected_total}")
-                    except:
-                        pass
-                else:
-                    got_fin = True
-                continue
-            if text.strip() == "RETR_DONE":
+            if len(data) < HDR_SIZE:
                 continue
 
-            parsed = parse_header_and_payload(data)
-            if parsed is None:
+            seq, total, payload_len, crc_recv, flags = struct.unpack(HDR_FMT, data[:HDR_SIZE])
+            payload = data[HDR_SIZE:HDR_SIZE+payload_len] if payload_len > 0 else b""
+
+            if flags == 2:
+                msg = payload.decode(errors="ignore")
+                print(f"[Client] Server ERROR: {msg}")
+                return
+
+            if flags == 1:
+                self.total_segments = total if self.total_segments is None else self.total_segments
+                print("[Client] EOF packet received")
                 continue
-            seq, total, payload_len, crc, payload = parsed
 
-            # apply simulated drops ONLY during the initial GET receive phase
-            if in_get_phase and seq in drop_list:
-                print(f"[SIM DROP] descartando segmento {seq} (simulado).")
+            if drop_set and seq in drop_set:
+                print(f"[Client] (SIMULATED DROP) Dropping seq {seq}")
                 continue
 
-            calc_crc = binascii.crc32(payload) & 0xffffffff
-            ok = (calc_crc == crc)
-            if not ok:
-                print(f"[!] CRC mismatch seq {seq} (calc {calc_crc} != hdr {crc})")
+            computed_crc = binascii.crc32(payload) & 0xffffffff
+            good = (computed_crc == crc_recv)
+            self.segments[seq] = payload
+            self.crc_ok[seq] = good
+            self.total_segments = total if self.total_segments is None else self.total_segments
 
-            segments[seq] = payload
-            crc_ok[seq] = ok
-            expected_total = total
-
-            if got_fin and expected_total is not None and len(segments) >= expected_total:
-                break
-
-        # After receive round: evaluate missing / corrupt
-        # stop simulating drops from now on (so RETR receives aren't dropped)
-        in_get_phase = False
-
-        if expected_total is None:
-            print("[!] Nao recebeu FIN; abortando tentativa.")
-            continue
-
-        missing = [i for i in range(1, expected_total+1) if i not in segments]
-        corrupt = [i for i, ok in crc_ok.items() if not ok]
-        for c in corrupt:
-            if c not in missing:
-                missing.append(c)
-        missing.sort()
-        print(f"[+] Round result: received {len(segments)} / {expected_total} segments. missing/corrupt: {missing}")
-
-        # If no missing or corrupt -> assemble file
-        if not missing:
-            outpath = os.path.join(".", f"Copy_{filename}")
-            with open(outpath, "wb") as out:
-                for i in range(1, expected_total+1):
-                    out.write(segments[i])
-            print(f"[OK] Arquivo reconstruido: {outpath}")
-            continue
-
-        # else: ask user whether to request retransmission
-        while True:
-            user = input(f"Digite 'RETR x,y,z', 'RETR all', 'status' ou 'quit': ").strip()
-            if not user:
-                continue
-            if user.lower() == "status":
-                print(f"missing: {missing}")
-                continue
-            if user.lower() == "quit":
-                print("Cancelando operacao.")
-                break
-            if user.upper().startswith("RETR"):
-                partsr = user.split()
-                if len(partsr) < 2:
-                    print("Uso: RETR 3,7,12 | RETR all | RETR filename 3,7,12")
-                    continue
-
-                # special "all" option: request all missing/corrupt
-                if partsr[1].lower() == "all":
-                    if not missing:
-                        print("[+] Nenhum segmento faltando — nada a retransmitir.")
-                        continue
-                    seqs = ",".join(str(x) for x in missing)
-                    msg = f"RETR {filename} {seqs}"
-                elif len(partsr) == 2 and "," in partsr[1]:
-                    seqs = partsr[1]
-                    msg = f"RETR {filename} {seqs}"
-                elif len(partsr) >= 3:
-                    msg = f"RETR {partsr[1]} {partsr[2]}"
-                else:
-                    seqs = " ".join(partsr[1:])
-                    msg = f"RETR {filename} {seqs}"
-
-                # Ensure we are NOT applying simulated drops during retransmission
-                in_get_phase = False
-
-                sock.sendto(msg.encode(), server_addr)
-                print(f"[+] Enviado: {msg}. Aguardando retransmissao...")
-                sock.settimeout(TIMEOUT)
-
-                while True:
-                    try:
-                        data, addr = sock.recvfrom(RECV_BUF)
-                    except socket.timeout:
-                        print("[!] Timeout aguardando retransmissao.")
-                        break
-                    try:
-                        text = data.decode(errors="ignore")
-                    except:
-                        text = ""
-                    if text == "RETR_DONE":
-                        print("[+] Servidor finalizou retransmissao desta rodada.")
-                        break
-                    if text.startswith("ERR"):
-                        print("[SERVER ERROR] " + text)
-                        break
-                    parsed = parse_header_and_payload(data)
-                    if parsed is None:
-                        continue
-                    seq, total, payload_len, crc, payload = parsed
-
-                    # IMPORTANT: do NOT simulate drops here — accept retransmissions normally
-                    calc_crc = binascii.crc32(payload) & 0xffffffff
-                    ok = (calc_crc == crc)
-                    if not ok:
-                        print(f"[!] CRC mismatch on retransmit seq {seq}")
-                    segments[seq] = payload
-                    crc_ok[seq] = ok
-
-                missing = [i for i in range(1, expected_total+1) if i not in segments]
-                corrupt = [i for i, ok in crc_ok.items() if not ok]
-                for c in corrupt:
-                    if c not in missing:
-                        missing.append(c)
-                missing.sort()
-                print(f"[+] Depois do RETR: faltando {len(missing)} segmentos: {missing}")
-                if not missing:
-                    outpath = os.path.join(".", f"Copy_{filename}")
-                    with open(outpath, "wb") as out:
-                        for i in range(1, expected_total+1):
-                            out.write(segments[i])
-                    print(f"[OK] Arquivo reconstruido: {outpath}")
-                    break
-                else:
-                    continue
+            if not good:
+                print(f"[Client] Segment {seq} CRC MISMATCH")
             else:
-                print("Comando nao reconhecido. Use RETR, status ou quit.")
-        # loop back to allow new GET
+                print(f"[Client] Segment {seq} received OK")
 
+    def get_missing_or_corrupted(self):
+        
+        if not self.total_segments:
+            return []
+        missing = []
+        for s in range(1, self.total_segments+1):
+            if s not in self.segments or not self.crc_ok.get(s, False):
+                missing.append(s)
+        return missing
+
+    def assemble_and_save(self):
+
+        if not self.total_segments or not self.filename:
+            print("[Client] Not able to build file: missing data.")
+            return False
+
+        missing = self.get_missing_or_corrupted()
+        if missing:
+            print(f"[Client] Stil missing packets: {missing}")
+            return False
+
+        out_path = os.path.join(self.save_dir, "Copy_" + self.filename)
+        with open(out_path, "wb") as f:
+            for s in range(1, self.total_segments+1):
+                f.write(self.segments[s])
+        print(f"[Client] File built and saved in {out_path}")
+        return True
+
+    def interactive(self):
+        print("Type: GET filename [drops] or RETR filename [drops] | 'all' or 'quit' to exit")
+        drop_set = set()
+
+        while True:
+            line = input(">> ").strip()
+            if not line:
+                continue
+            if line.lower() == "quit":
+                break
+
+            parts = line.split()
+            cmd = parts[0].upper()
+
+            if cmd == "GET":
+                if len(parts) < 2:
+                    print("Type: GET filename [drops]")
+                    continue
+                self.filename = parts[1]
+                self.total_segments = None
+                self.segments.clear()
+                self.crc_ok.clear()
+                drop_set = set()
+                if len(parts) >= 3:
+                    try:
+                        drop_set = set(int(x) for x in parts[2].split(",") if x.strip())
+                        print(f"[Client] Simulating drops in: {sorted(drop_set)}")
+                    except ValueError:
+                        print("[Client] Invalid list, ignoring drops")
+
+                self.send_request(f"GET {self.filename}")
+                self.receive_file_cycle(drop_set)
+                print(f"[Client] GET terminou. Pacotes faltando: {self.get_missing_or_corrupted()}")
+
+            elif cmd == "RETR":
+                if len(parts) < 3:
+                    print("Type: RETR filename [drops] | all")
+                    continue
+                fname = parts[1]
+                if self.filename != fname:
+                    print(f"[Client] You asked to retrie from {fname}, but the current file is {self.filename}")
+                    continue
+
+                if parts[2].lower() == "all":
+                    seqs = self.get_missing_or_corrupted()
+                else:
+                    try:
+                        seqs = [int(x) for x in parts[2].split(",") if x.strip()]
+                    except ValueError:
+                        print("[Client] Invalid list")
+                        continue
+
+                if not seqs:
+                    print("[Client] No packet to retrieve")
+                    continue
+
+                retr_msg = f"RETR {fname} " + ",".join(str(s) for s in seqs)
+                self.send_request(retr_msg)
+                self.receive_file_cycle()
+                print(f"[Client] RETR done. Stil missing: {self.get_missing_or_corrupted()}")
+
+                # tentar montar se completo
+                self.assemble_and_save()
+
+            else:
+                print("Unknown command.")
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="UDP File Client")
+    parser.add_argument("--server-ip", required=True, help="IP do servidor UDP")
+    parser.add_argument("--server-port", type=int, help="Porta do servidor UDP")
+    args = parser.parse_args()
+
+    client = UDPFileClient(args.server_ip, args.server_port, save_dir=args.save_dir)
+    try:
+        client.interactive()
+    except KeyboardInterrupt:
+        print("\n[Client] Exiting")
+    finally:
+        client.sock.close()
+

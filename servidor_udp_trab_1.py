@@ -1,135 +1,139 @@
-# server.py
+"""
+Protocolo: GET filename [droplist] / RETR filename seq1,seq2,...
+Cabeçalho por segmento: struct.pack('!IIHIB', seq, total, payload_len, crc32, flags)
+flags: 0=data, 1=EOF, 2=ERROR (payload contains error message)
+"""
+
 import socket
 import struct
 import os
-import threading
+import time
 import binascii
 
-BASE_DIR = r"C:/Users/Lucas/redes_utfpr/trab_1"
-SERVER_PORT = 12000
-PAYLOAD_SIZE = 1024  # bytes per UDP payload
-HDR_FMT = "!IIHI"    # seq (4), total (4), payload_len (2), crc32 (4)
+PAYLOAD_SIZE = 1024  # bytes of file data per UDP packet
+HDR_FMT = "!IIHIB"   # seq(4), total(4), payload_len(2), crc32(4), flags(1)
 HDR_SIZE = struct.calcsize(HDR_FMT)
+SLEEP_BETWEEN_SENDS = 0.001
 
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.bind(("0.0.0.0", SERVER_PORT))
-print(f"[+] UDP server listening on port {SERVER_PORT}")
+class UDPFileServer:
+    def __init__(self):
+        self.host = "0.0.0.0"
+        self.port = 12000
+        self.directory = r"C:/Users/Lucas/redes_utfpr/trab_1"
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind((self.host, self.port))
+        print(f"[Server] Listening on {self.host}:{self.port}, serving dir: {self.directory}")
+        self.start()
 
-# Keep file segments in memory while serving RETR (could be large; ok for lab)
-file_cache = {}  # key: (client_addr, filename) -> list of segment bytes (index 1..total)
-
-def pack_segment(seq, total, payload_bytes):
-    payload_len = len(payload_bytes)
-    crc = binascii.crc32(payload_bytes) & 0xffffffff
-    header = struct.pack(HDR_FMT, seq, total, payload_len, crc)
-    return header + payload_bytes
-
-def handle_request(data, client_addr):
-    text = data.decode(errors="ignore").strip()
-    parts = text.split()
-    if not parts:
-        return
-    cmd = parts[0].upper()
-    if cmd == "GET":
-        if len(parts) < 2:
-            sock.sendto(b"ERR GET sem nome de arquivo", client_addr)
-            return
-        filename = parts[1]
-        filepath = os.path.join(BASE_DIR, filename)
-        if not os.path.isfile(filepath):
-            sock.sendto(b"ERR Arquivo nao encontrado", client_addr)
-            print(f"[-] {client_addr} requested missing file {filename}")
-            return
-
-        # Read file and segment
-        with open(filepath, "rb") as f:
-            data_bytes = f.read()
-        total = (len(data_bytes) + PAYLOAD_SIZE - 1) // PAYLOAD_SIZE
-        segments = [None] * (total + 1)  # index by 1..total
-        for i in range(total):
-            start = i * PAYLOAD_SIZE
-            chunk = data_bytes[start:start+PAYLOAD_SIZE]
-            seg = pack_segment(i+1, total, chunk)
-            segments[i+1] = seg
-
-        # cache segments for possible retransmission
-        file_cache[(client_addr, filename)] = segments
-
-        # send all segments
-        print(f"[+] Sending {filename} to {client_addr} in {total} segments")
-        for i in range(1, total+1):
-            sock.sendto(segments[i], client_addr)
-
-        # send FIN
-        fin_msg = f"FIN {total}".encode()
-        sock.sendto(fin_msg, client_addr)
-        print(f"[+] Sent FIN to {client_addr}")
-
-    elif cmd == "RETR":
-        # format RETR filename? or RETR seqlist? We'll accept "RETR filename 3,7,12" or "RETR 3,7,12"
-        # For simplicity, if first argument doesn't contain comma, treat as filename; else use last GET'd filename stored.
-        # We'll parse flexible forms:
-        args = parts[1:]
-        if not args:
-            sock.sendto(b"ERR RETR sem argumentos", client_addr)
-            return
-        # Try to find cached (client_addr, filename) entry
-        # Choose filename if provided
-        if len(args) == 1 and "," in args[0]:
-            seq_list_str = args[0]
-            # try to find any cached file for this client
-            candidate = None
-            for (addr, fname) in file_cache.keys():
-                if addr == client_addr:
-                    candidate = fname
-                    break
-            if candidate is None:
-                sock.sendto(b"ERR RETR sem contexto de arquivo", client_addr)
-                return
-            filename = candidate
-        else:
-            # maybe args[0] is filename and args[1] is seqlist
-            if len(args) >= 2:
-                filename = args[0]
-                seq_list_str = args[1]
-            else:
-                # maybe only filename provided -> nothing to retransmit
-                sock.sendto(b"ERR RETR formato invalido", client_addr)
-                return
-
-        key = (client_addr, filename)
-        if key not in file_cache:
-            sock.sendto(b"ERR RETR sem arquivo em cache", client_addr)
-            return
-        segments = file_cache[key]
-        seqs = []
-        for token in seq_list_str.split(","):
-            token = token.strip()
-            if not token:
-                continue
-            try:
-                s = int(token)
-                seqs.append(s)
-            except:
-                continue
-        print(f"[+] RETR from {client_addr} for {filename}: {seqs}")
-        for s in seqs:
-            if 1 <= s < len(segments) and segments[s] is not None:
-                sock.sendto(segments[s], client_addr)
-        # optional: after retransmit, send ACK or FIN fragment; we'll send a small marker
-        sock.sendto(b"RETR_DONE", client_addr)
-    else:
-        sock.sendto(b"ERR Comando desconhecido", client_addr)
-
-def main_loop():
-    while True:
+    def start(self):
         try:
-            data, client_addr = sock.recvfrom(4096)
-            # handle in new thread so server can receive other requests
-            threading.Thread(target=handle_request, args=(data, client_addr), daemon=True).start()
+            while True:
+                data, client = self.sock.recvfrom(4096)
+                text = data.decode(errors="ignore").strip()
+                print(f"[Server] Received from {client}: {text}")
+                # Handle request in a thread so server can continue listening
+                # t = threading.Thread(target=self.handle_request, args=(text, client))
+                # t.daemon = True
+                # t.start()
+                self.handle_request(text, client)
         except KeyboardInterrupt:
-            print("Shutting down server.")
-            break
+            print("\n[Server] Shutting down.")
+        finally:
+            self.sock.close()
+
+    def handle_request(self, text, client_addr):
+        # Request formats supported:
+        # GET filename [droplist]   (droplist is ignored by server; for client-only simulation)
+        # RETR filename seq1,seq2,...
+        parts = text.split()
+        if len(parts) < 2:
+            self.send_error(client_addr, "Invalid request format")
+            return
+
+        cmd = parts[0].upper()
+        if cmd == "GET":
+            filename = parts[1]
+            self.send_file(client_addr, filename)
+        elif cmd == "RETR":
+            # Expect: RETR filename seq1,seq2,...
+            if len(parts) < 3:
+                self.send_error(client_addr, "RETR requires filename and sequence list")
+                return
+            filename = parts[1]
+            seq_list_str = parts[2]
+            try:
+                seqs = [int(s) for s in seq_list_str.split(",") if s.strip()]
+                self.retransmit_segments(client_addr, filename, seqs)
+            except ValueError:
+                self.send_error(client_addr, "Invalid sequence list for RETR")
+        else:
+            self.send_error(client_addr, f"Unknown command: {cmd}")
+
+    def send_error(self, client_addr, msg):
+        payload = msg.encode()
+        crc = binascii.crc32(payload) & 0xffffffff
+        header = struct.pack(HDR_FMT, 0, 0, len(payload), crc, 2)
+        packet = header + payload
+        self.sock.sendto(packet, client_addr)
+        print(f"[Server] Sent ERROR to {client_addr}: {msg}")
+
+    def send_file(self, client_addr, filename):
+        path = os.path.join(self.directory, filename)
+        if not os.path.isfile(path):
+            self.send_error(client_addr, "File not found")
+            return
+
+        file_size = os.path.getsize(path)
+        total_segments = (file_size + PAYLOAD_SIZE - 1) // PAYLOAD_SIZE
+        print(f"[Server] Sending '{filename}' ({file_size} bytes) in {total_segments} segments to {client_addr}")
+
+        with open(path, "rb") as f:
+            seq = 1
+            while True:
+                chunk = f.read(PAYLOAD_SIZE)
+                if not chunk:
+                    break
+                crc = binascii.crc32(chunk) & 0xffffffff
+                header = struct.pack(HDR_FMT, seq, total_segments, len(chunk), crc, 0)
+                packet = header + chunk
+                self.sock.sendto(packet, client_addr)
+                seq += 1
+                time.sleep(SLEEP_BETWEEN_SENDS)
+
+        # send EOF packet (no payload, flags=1)
+        header = struct.pack(HDR_FMT, 0, total_segments, 0, 0, 1)
+        self.sock.sendto(header, client_addr)
+        print(f"[Server] Finished sending '{filename}' to {client_addr} (EOF)")
+
+    def retransmit_segments(self, client_addr, filename, seqs):
+        path = os.path.join(self.directory, filename)
+        if not os.path.isfile(path):
+            self.send_error(client_addr, "File not found")
+            return
+
+        file_size = os.path.getsize(path)
+        total_segments = (file_size + PAYLOAD_SIZE - 1) // PAYLOAD_SIZE
+        print(f"[Server] RETR request for '{filename}' seqs={seqs} to {client_addr}")
+
+        with open(path, "rb") as f:
+            for seq in seqs:
+                if seq < 1 or seq > total_segments:
+                    # skip invalid seq numbers (could also send an error)
+                    print(f"[Server] Ignoring invalid seq {seq}")
+                    continue
+                offset = (seq - 1) * PAYLOAD_SIZE
+                f.seek(offset)
+                chunk = f.read(PAYLOAD_SIZE)
+                crc = binascii.crc32(chunk) & 0xffffffff
+                header = struct.pack(HDR_FMT, seq, total_segments, len(chunk), crc, 0)
+                packet = header + chunk
+                self.sock.sendto(packet, client_addr)
+                time.sleep(SLEEP_BETWEEN_SENDS)
+        # After retransmits, send EOF to mark end of this batch
+        header = struct.pack(HDR_FMT, 0, total_segments, 0, 0, 1)
+        self.sock.sendto(header, client_addr)
+        print(f"[Server] Finished RETR batch for '{filename}' to {client_addr}")
 
 if __name__ == "__main__":
-    main_loop()
+    server = UDPFileServer()
+    #server.start()
