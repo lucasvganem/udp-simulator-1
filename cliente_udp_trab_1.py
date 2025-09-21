@@ -23,12 +23,11 @@ PAYLOAD_SIZE = 1024
 RECV_BUFFER = 65536
 
 class UDPFileClient:
-    def __init__(self, server_ip, server_port, save_dir="."):
+    def __init__(self, server_ip, server_port):
         self.server = (server_ip, server_port)
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.settimeout(TIMEOUT)
-        self.save_dir = save_dir
-        # armazenamento entre comandos
+        self.save_dir = r"C:/Users/Lucas/redes_utfpr/trab_1"
         self.filename = None
         self.total_segments = None
         self.segments = {}      # seq -> bytes
@@ -40,10 +39,6 @@ class UDPFileClient:
         print(f"[Client] Sent request: {text}")
 
     def receive_file_cycle(self, drop_set=None):
-        """
-        Recebe segmentos até timeout ou EOF.
-        Atualiza self.segments e self.crc_ok.
-        """
         while True:
             try:
                 data, _ = self.sock.recvfrom(RECV_BUFFER)
@@ -80,8 +75,7 @@ class UDPFileClient:
             else:
                 print(f"[Client] Segment {seq} received OK")
 
-    def get_missing_or_corrupted(self):
-        
+    def get_missing_or_corrupted(self):  
         if not self.total_segments:
             return []
         missing = []
@@ -91,7 +85,6 @@ class UDPFileClient:
         return missing
 
     def assemble_and_save(self):
-
         if not self.total_segments or not self.filename:
             print("[Client] Not able to build file: missing data.")
             return False
@@ -107,13 +100,61 @@ class UDPFileClient:
                 f.write(self.segments[s])
         print(f"[Client] File built and saved in {out_path}")
         return True
+    
+    def get_cmd(self, parts):
+        if len(parts) < 2:
+            print("[Client] Invalid entry")
+            return False
+        self.filename = parts[1]
+        self.total_segments = None
+        self.segments.clear()
+        self.crc_ok.clear()
+        drop_set = set()
+        if len(parts) >= 3:
+            try:
+                drop_set = set(int(x) for x in parts[2].split(",") if x.strip())
+                print(f"[Client] Simulating drops in: {sorted(drop_set)}")
+            except ValueError:
+                print("[Client] Invalid list, ignoring drops")
+
+        self.send_request(f"GET {self.filename}")
+        self.receive_file_cycle(drop_set)
+        print(f"[Client] GET done. Missing packets: {self.get_missing_or_corrupted()}")
+        self.assemble_and_save()
+        return True
+
+    def retr_cmd(self, parts):
+        if len(parts) < 3:
+            print("[Client] Invalid entry")
+            return False
+        fname = parts[1]
+        if self.filename != fname:
+            print(f"[Client] You asked to retrie from {fname}, but the current file is {self.filename}")
+            return False
+
+        if parts[2].lower() == "all":
+            seqs = self.get_missing_or_corrupted()
+        else:
+            try:
+                seqs = [int(x) for x in parts[2].split(",") if x.strip()]
+            except ValueError:
+                print("[Client] Invalid list")
+                return False
+
+        if not seqs:
+            print("[Client] No packet to retrieve")
+            return False
+
+        retr_msg = f"RETR {fname} " + ",".join(str(s) for s in seqs)
+        self.send_request(retr_msg)
+        self.receive_file_cycle()
+        print(f"[Client] RETR done. Stil missing: {self.get_missing_or_corrupted()}")
+        self.assemble_and_save()
+        return True
 
     def interactive(self):
-        print("Type: GET filename [drops] or RETR filename [drops] | 'all' or 'quit' to exit")
-        drop_set = set()
-
         while True:
-            line = input(">> ").strip()
+            line = input("Type: GET filename [drops] or RETR filename [drops] | 'all' or 'quit' to exit\n>> ").strip()
             if not line:
                 continue
             if line.lower() == "quit":
@@ -123,28 +164,15 @@ class UDPFileClient:
             cmd = parts[0].upper()
 
             if cmd == "GET":
-                if len(parts) < 2:
-                    print("Type: GET filename [drops]")
+                if not self.get_cmd(parts):
                     continue
-                self.filename = parts[1]
-                self.total_segments = None
-                self.segments.clear()
-                self.crc_ok.clear()
-                drop_set = set()
-                if len(parts) >= 3:
-                    try:
-                        drop_set = set(int(x) for x in parts[2].split(",") if x.strip())
-                        print(f"[Client] Simulating drops in: {sorted(drop_set)}")
-                    except ValueError:
-                        print("[Client] Invalid list, ignoring drops")
-
-                self.send_request(f"GET {self.filename}")
-                self.receive_file_cycle(drop_set)
-                print(f"[Client] GET terminou. Pacotes faltando: {self.get_missing_or_corrupted()}")
 
             elif cmd == "RETR":
+                if not self.retr_cmd(parts):
+                    continue
+                """
                 if len(parts) < 3:
-                    print("Type: RETR filename [drops] | all")
+                    print("[Client] Invalid entry")
                     continue
                 fname = parts[1]
                 if self.filename != fname:
@@ -169,19 +197,19 @@ class UDPFileClient:
                 self.receive_file_cycle()
                 print(f"[Client] RETR done. Stil missing: {self.get_missing_or_corrupted()}")
 
-                # tentar montar se completo
                 self.assemble_and_save()
+                """
 
             else:
                 print("Unknown command.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="UDP File Client")
-    parser.add_argument("--server-ip", required=True, help="IP do servidor UDP")
-    parser.add_argument("--server-port", type=int, help="Porta do servidor UDP")
+    parser.add_argument("--server-ip", required=True, help="UDP server ID")
+    parser.add_argument("--server-port", type=int, help="UDP server door")
     args = parser.parse_args()
 
-    client = UDPFileClient(args.server_ip, args.server_port, save_dir=args.save_dir)
+    client = UDPFileClient(args.server_ip, args.server_port)
     try:
         client.interactive()
     except KeyboardInterrupt:
