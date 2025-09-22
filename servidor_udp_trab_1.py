@@ -10,7 +10,7 @@ class UDPFileServer:
         self.host = "0.0.0.0"
         self.port = 12000
         self.directory = r"C:/Users/Lucas/redes_utfpr/trab_1"
-        self.payload_size = 1024
+        self.payload_size = 65000
         self.hdr_fmt = "!IIHIB"
         self.hdr_size = struct.calcsize(self.hdr_fmt)
         self.sleep_between_sends = 0.001
@@ -22,7 +22,7 @@ class UDPFileServer:
     def start(self):
         try:
             while True:
-                data, client = self.sock.recvfrom(4096)
+                data, client = self.sock.recvfrom(65536)
                 text = data.decode(errors="ignore").strip()
                 print(f"[Server] Received from {client}: {text}")
                 t = threading.Thread(target=self.handle_request, args=(text, client))
@@ -88,6 +88,7 @@ class UDPFileServer:
                 crc = binascii.crc32(chunk) & 0xffffffff
                 header = struct.pack(self.hdr_fmt, seq, total_segments, len(chunk), crc, 0)
                 packet = header + chunk
+                print(f"[Server] Packet no. {seq} | Sizes of hdr: {len(header)}, chunk: {len(chunk)}, packet: {len(packet)}")
                 self.sock.sendto(packet, client_addr)
                 seq += 1
                 time.sleep(self.sleep_between_sends)

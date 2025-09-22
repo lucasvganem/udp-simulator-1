@@ -1,37 +1,24 @@
-"""
-UDP File Client (orientado a objetos)
-Uso: python client.py --server-ip <ip> --server-port <port>
-O cliente solicita: GET filename [droplist]
-Exemplo de GET com simulação de perda (o cliente vai "dropar" os segmentos 3,7,12 quando recebê-los):
-GET abc.ext 3,7,12
-
-Para pedir retransmissão de segmentos:
-RETR filename 3,7,12
-RETR filename all
-"""
-
 import socket
 import struct
 import argparse
 import binascii
 import os
 
-HDR_FMT = "!IIHIB"
-HDR_SIZE = struct.calcsize(HDR_FMT)
-TIMEOUT = 2.0
-PAYLOAD_SIZE = 1024
-RECV_BUFFER = 65536
-
 class UDPFileClient:
     def __init__(self, server_ip, server_port):
         self.server = (server_ip, server_port)
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.settimeout(TIMEOUT)
+        self.hdr_fmt = "!IIHIB"
+        self.hdr_size = struct.calcsize(self.hdr_fmt)
+        self.timeout = 2.0
+        self.payload_size = 65000
+        self.recv_buffer = 65536
+        self.sock.settimeout(self.timeout)
         self.save_dir = r"C:/Users/Lucas/redes_utfpr/trab_1"
         self.filename = None
         self.total_segments = None
-        self.segments = {}      # seq -> bytes
-        self.crc_ok = {}        # seq -> bool
+        self.segments = {}
+        self.crc_ok = {}
         print(f"[Client] Server set to {self.server}")
 
     def send_request(self, text):
@@ -41,14 +28,14 @@ class UDPFileClient:
     def receive_file_cycle(self, drop_set=None):
         while True:
             try:
-                data, _ = self.sock.recvfrom(RECV_BUFFER)
+                data, _ = self.sock.recvfrom(self.recv_buffer)
             except socket.timeout:
                 break
-            if len(data) < HDR_SIZE:
+            if len(data) < self.hdr_size:
                 continue
 
-            seq, total, payload_len, crc_recv, flags = struct.unpack(HDR_FMT, data[:HDR_SIZE])
-            payload = data[HDR_SIZE:HDR_SIZE+payload_len] if payload_len > 0 else b""
+            seq, total, payload_len, crc_recv, flags = struct.unpack(self.hdr_fmt, data[:self.hdr_size])
+            payload = data[self.hdr_size:self.hdr_size+payload_len] if payload_len > 0 else b""
 
             if flags == 2:
                 msg = payload.decode(errors="ignore")
@@ -170,38 +157,9 @@ class UDPFileClient:
             elif cmd == "RETR":
                 if not self.retr_cmd(parts):
                     continue
-                """
-                if len(parts) < 3:
-                    print("[Client] Invalid entry")
-                    continue
-                fname = parts[1]
-                if self.filename != fname:
-                    print(f"[Client] You asked to retrie from {fname}, but the current file is {self.filename}")
-                    continue
-
-                if parts[2].lower() == "all":
-                    seqs = self.get_missing_or_corrupted()
-                else:
-                    try:
-                        seqs = [int(x) for x in parts[2].split(",") if x.strip()]
-                    except ValueError:
-                        print("[Client] Invalid list")
-                        continue
-
-                if not seqs:
-                    print("[Client] No packet to retrieve")
-                    continue
-
-                retr_msg = f"RETR {fname} " + ",".join(str(s) for s in seqs)
-                self.send_request(retr_msg)
-                self.receive_file_cycle()
-                print(f"[Client] RETR done. Stil missing: {self.get_missing_or_corrupted()}")
-
-                self.assemble_and_save()
-                """
-
+                
             else:
-                print("Unknown command.")
+                print("[Client] Unknown command")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="UDP File Client")
